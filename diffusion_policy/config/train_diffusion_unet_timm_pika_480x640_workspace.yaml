@@ -1,0 +1,22 @@
+defaults:
+  - train_diffusion_unet_timm_umi_workspace
+  - _self_
+
+name: train_diffusion_unet_timm_pika_480x640
+
+policy:
+  obs_encoder:
+    # 224-only ViT doesn't work for 480x640 inputs.
+    # Use a conv backbone that supports arbitrary image sizes.
+    model_name: 'resnet34.a1_in1k'
+    pretrained: True
+    frozen: False
+    feature_aggregation: 'spatial_embedding'
+    downsample_ratio: 32
+    transforms: null
+    imagenet_norm: True
+    use_group_norm: False
+
+logging:
+  project: umi
+  mode: offline
