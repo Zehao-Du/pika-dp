@@ -13,14 +13,21 @@ ignore_proprioception: False
 
 shape_meta: &shape_meta
   obs:
-    camera0_rgb:
+    rgb:
       shape: [3, 480, 640]
       horizon: ${task.img_obs_horizon}
       latency_steps: 0
       down_sample_steps: ${task.obs_down_sample_steps}
       type: rgb
       ignore_by_policy: False
-    camera1_rgb:
+    depth:
+      shape: [1, 480, 640]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0
+      down_sample_steps: ${task.obs_down_sample_steps}
+      type: depth
+      ignore_by_policy: False
+    fisheye:
       shape: [3, 480, 640]
       horizon: ${task.img_obs_horizon}
       latency_steps: 0

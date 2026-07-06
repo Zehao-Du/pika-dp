@@ -7,6 +7,11 @@ import pathlib
 import numpy as np
 import torch
 import zarr
+try:
+    from zarr.storage import MemoryStore, ZipStore
+except ImportError:
+    MemoryStore = zarr.MemoryStore
+    ZipStore = zarr.ZipStore
 from threadpoolctl import threadpool_limits
 from tqdm import trange, tqdm
 from filelock import FileLock
@@ -26,6 +31,13 @@ from umi.common.pose_util import pose_to_mat, mat_to_pose10d
 
 register_codecs()
 
+
+def _open_group_readonly(store):
+    try:
+        return zarr.open_group(store=store, mode='r', zarr_format=2)
+    except TypeError:
+        return zarr.open_group(store=store, mode='r')
+
 class UmiDataset(BaseDataset):
     def __init__(self,
         shape_meta: dict,
@@ -39,18 +51,22 @@ class UmiDataset(BaseDataset):
         val_ratio: float=0.0,
         max_duration: Optional[float]=None
     ):
+        self.dataset_path = dataset_path
+        self.cache_dir = cache_dir
+        self._uses_zip_store = cache_dir is None
+        self._zip_store = None
+        self._zip_store_pid = None
         self.pose_repr = pose_repr
         self.obs_pose_repr = self.pose_repr.get('obs_pose_repr', 'rel')
         self.action_pose_repr = self.pose_repr.get('action_pose_repr', 'rel')
         
         if cache_dir is None:
-            # load into memory store
-            with zarr.ZipStore(dataset_path, mode='r') as zip_store:
-                replay_buffer = ReplayBuffer.copy_from_store(
-                    src_store=zip_store, 
-                    store=zarr.MemoryStore()
-                )
+            # Keep the zip store open and use zarr arrays directly.
+            # SequenceSampler loads low-dim arrays to memory and keeps image arrays lazy.
+            replay_buffer = self._open_zip_replay_buffer()
         else:
+            if not hasattr(zarr, "LMDBStore"):
+                raise RuntimeError("cache_dir requires zarr.LMDBStore, which is unavailable in the current zarr version.")
             # TODO: refactor into a stand alone function?
             # determine path name
             mod_time = os.path.getmtime(dataset_path)
@@ -71,7 +87,7 @@ class UmiDataset(BaseDataset):
                         with zarr.LMDBStore(str(cache_path),     
                             writemap=True, metasync=False, sync=False, map_async=True, lock=False
                             ) as lmdb_store:
-                            with zarr.ZipStore(dataset_path, mode='r') as zip_store:
+                            with ZipStore(dataset_path, mode='r') as zip_store:
                                 print(f"Copying data to {str(cache_path)}")
                                 ReplayBuffer.copy_from_store(
                                     src_store=zip_store,
@@ -90,6 +106,7 @@ class UmiDataset(BaseDataset):
         
         self.num_robot = 0
         rgb_keys = list()
+        depth_keys = list()
         lowdim_keys = list()
         key_horizon = dict()
         key_down_sample_steps = dict()
@@ -100,8 +117,12 @@ class UmiDataset(BaseDataset):
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
                 rgb_keys.append(key)
+            elif type == 'depth':
+                depth_keys.append(key)
             elif type == 'low_dim':
                 lowdim_keys.append(key)
+            else:
+                raise RuntimeError(f"Unsupported obs type: {type}")
 
             if key.endswith('eef_pos'):
                 self.num_robot += 1
@@ -129,6 +150,7 @@ class UmiDataset(BaseDataset):
             seed=seed
         )
         train_mask = ~val_mask
+        self.episode_mask = train_mask
 
         self.sampler_lowdim_keys = list()
         for key in lowdim_keys:
@@ -146,7 +168,7 @@ class UmiDataset(BaseDataset):
         sampler = SequenceSampler(
             shape_meta=shape_meta,
             replay_buffer=replay_buffer,
-            rgb_keys=rgb_keys,
+            rgb_keys=rgb_keys + depth_keys,
             lowdim_keys=self.sampler_lowdim_keys,
             key_horizon=key_horizon,
             key_latency_steps=key_latency_steps,
@@ -159,6 +181,8 @@ class UmiDataset(BaseDataset):
         self.shape_meta = shape_meta
         self.replay_buffer = replay_buffer
         self.rgb_keys = rgb_keys
+        self.depth_keys = depth_keys
+        self.image_keys = rgb_keys + depth_keys
         self.lowdim_keys = lowdim_keys
         self.key_horizon = key_horizon
         self.key_latency_steps = key_latency_steps
@@ -171,21 +195,54 @@ class UmiDataset(BaseDataset):
         self.temporally_independent_normalization = temporally_independent_normalization
         self.threadpool_limits_is_applied = False
 
-    
-    def get_validation_dataset(self):
-        val_set = copy.copy(self)
-        val_set.sampler = SequenceSampler(
+    def _open_zip_replay_buffer(self):
+        if self._zip_store is not None:
+            try:
+                self._zip_store.close()
+            except Exception:
+                pass
+        self._zip_store = ZipStore(self.dataset_path, mode='r')
+        self._zip_store_pid = os.getpid()
+        return ReplayBuffer.create_from_group(
+            group=_open_group_readonly(self._zip_store)
+        )
+
+    def _build_sampler(self, replay_buffer, episode_mask):
+        return SequenceSampler(
             shape_meta=self.shape_meta,
-            replay_buffer=self.replay_buffer,
-            rgb_keys=self.rgb_keys,
+            replay_buffer=replay_buffer,
+            rgb_keys=self.image_keys,
             lowdim_keys=self.sampler_lowdim_keys,
             key_horizon=self.key_horizon,
             key_latency_steps=self.key_latency_steps,
             key_down_sample_steps=self.key_down_sample_steps,
-            episode_mask=self.val_mask,
+            episode_mask=episode_mask,
             action_padding=self.action_padding,
             repeat_frame_prob=self.repeat_frame_prob,
             max_duration=self.max_duration
+        )
+
+    def _ensure_worker_local_zip_store(self):
+        if not self._uses_zip_store:
+            return
+        pid = os.getpid()
+        if self._zip_store_pid == pid:
+            return
+        ignore_rgb = getattr(self.sampler, 'ignore_rgb_is_applied', False)
+        self.replay_buffer = self._open_zip_replay_buffer()
+        self.sampler = self._build_sampler(
+            replay_buffer=self.replay_buffer,
+            episode_mask=self.episode_mask
+        )
+        self.sampler.ignore_rgb(ignore_rgb)
+
+    
+    def get_validation_dataset(self):
+        val_set = copy.copy(self)
+        val_set.episode_mask = self.val_mask
+        val_set.sampler = val_set._build_sampler(
+            replay_buffer=self.replay_buffer,
+            episode_mask=val_set.episode_mask
         )
         val_set.val_mask = ~self.val_mask
         return val_set
@@ -245,12 +302,15 @@ class UmiDataset(BaseDataset):
         # image
         for key in self.rgb_keys:
             normalizer[key] = get_image_identity_normalizer()
+        for key in self.depth_keys:
+            normalizer[key] = get_image_identity_normalizer()
         return normalizer
 
     def __len__(self):
         return len(self.sampler)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        self._ensure_worker_local_zip_store()
         if not self.threadpool_limits_is_applied:
             threadpool_limits(1)
             self.threadpool_limits_is_applied = True
@@ -265,6 +325,15 @@ class UmiDataset(BaseDataset):
             # convert uint8 image to float32
             obs_dict[key] = np.moveaxis(data[key], -1, 1).astype(np.float32) / 255.
             # T,C,H,W
+            del data[key]
+        for key in self.depth_keys:
+            if not key in data:
+                continue
+            # move channel last to channel first
+            # T,H,W,1
+            # depth is already metric float32 from the replay buffer
+            obs_dict[key] = np.moveaxis(data[key], -1, 1).astype(np.float32)
+            # T,1,H,W
             del data[key]
         for key in self.sampler_lowdim_keys:
             obs_dict[key] = data[key].astype(np.float32)

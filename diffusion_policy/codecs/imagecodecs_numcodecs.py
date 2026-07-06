@@ -40,7 +40,10 @@ import numpy
 from numcodecs.abc import Codec
 from numcodecs.registry import register_codec, get_codec
 
-import imagecodecs
+try:
+    import imagecodecs
+except ModuleNotFoundError:
+    imagecodecs = None
 
 
 def protective_squeeze(x: numpy.ndarray):
@@ -56,6 +59,8 @@ def protective_squeeze(x: numpy.ndarray):
     return x.reshape(img_shape)
 
 def get_default_image_compressor(**kwargs):
+    if imagecodecs is None:
+        raise ModuleNotFoundError("imagecodecs is required to create imagecodecs-based compressors.")
     if imagecodecs.JPEGXL:
         # has JPEGXL
         this_kwargs = {
@@ -1353,6 +1358,10 @@ def _flat(out):
 
 def register_codecs(codecs=None, force=False, verbose=True):
     """Register codecs in this module with numcodecs."""
+    if imagecodecs is None:
+        if verbose:
+            log_warning("imagecodecs is not installed; skipping imagecodecs numcodec registration")
+        return
     for name, cls in globals().items():
         if not hasattr(cls, 'codec_id') or name == 'Codec':
             continue
