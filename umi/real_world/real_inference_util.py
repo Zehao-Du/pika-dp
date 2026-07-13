@@ -1,6 +1,7 @@
 from typing import Dict, Callable, Tuple, List
 import numpy as np
 import collections
+import cv2
 from diffusion_policy.common.cv2_util import get_image_transform
 from diffusion_policy.common.pose_repr_util import (
     compute_relative_pose, 
@@ -28,6 +29,23 @@ def get_real_obs_resolution(
     return out_res
 
 
+def _get_depth_obs(depth_in: np.ndarray, shape) -> np.ndarray:
+    if depth_in.ndim == 3:
+        depth_in = depth_in[..., None]
+    t, hi, wi, ci = depth_in.shape
+    co, ho, wo = shape
+    assert co == 1
+    assert ci == 1
+
+    depth_out = depth_in
+    if (ho != hi) or (wo != wi):
+        depth_out = np.stack([
+            cv2.resize(x[..., 0], (wo, ho), interpolation=cv2.INTER_NEAREST)[..., None]
+            for x in depth_in
+        ])
+    return np.moveaxis(depth_out.astype(np.float32), -1, 1)
+
+
 def get_real_obs_dict(
         env_obs: Dict[str, np.ndarray], 
         shape_meta: dict,
@@ -53,6 +71,8 @@ def get_real_obs_dict(
                     out_imgs = out_imgs.astype(np.float32) / 255
             # THWC to TCHW
             obs_dict_np[key] = np.moveaxis(out_imgs,-1,1)
+        elif type == 'depth':
+            obs_dict_np[key] = _get_depth_obs(env_obs[key], shape)
         elif type == 'low_dim':
             this_data_in = env_obs[key]
             obs_dict_np[key] = this_data_in
@@ -89,6 +109,8 @@ def get_real_umi_obs_dict(
                     out_imgs = out_imgs.astype(np.float32) / 255
             # THWC to TCHW
             obs_dict_np[key] = np.moveaxis(out_imgs,-1,1)
+        elif type == 'depth':
+            obs_dict_np[key] = _get_depth_obs(env_obs[key], shape)
         elif type == 'low_dim' and ('eef' not in key):
             this_data_in = env_obs[key]
             obs_dict_np[key] = this_data_in
@@ -168,6 +190,18 @@ def get_real_umi_obs_dict(
             # obs_dict_np[f'robot{robot_id}_eef_pos_wrt_start'] = rel_obs_pose[:,:3]
             obs_dict_np[f'robot{robot_id}_eef_rot_axis_angle_wrt_start'] = rel_obs_pose[:,3:]
 
+    missing_keys = [
+        key for key, attr in obs_shape_meta.items()
+        if not attr.get('ignore_by_policy', False) and key not in obs_dict_np
+    ]
+    if missing_keys:
+        hint = ""
+        if any(key.endswith('_wrt_start') for key in missing_keys):
+            hint = " Keys ending with '_wrt_start' require episode_start_pose."
+        raise RuntimeError(
+            "get_real_umi_obs_dict did not produce required policy obs keys: "
+            f"{missing_keys}.{hint}")
+
     return obs_dict_np
 
 def get_real_umi_action(
@@ -175,15 +209,49 @@ def get_real_umi_action(
         env_obs: Dict[str, np.ndarray], 
         action_pose_repr: str='abs'
     ):
-
     n_robots = int(action.shape[-1] // 10)
-    env_action = list()
+    base_poses = list()
     for robot_idx in range(n_robots):
-        # convert pose to mat
-        pose_mat = pose_to_mat(np.concatenate([
+        base_poses.append(np.concatenate([
             env_obs[f'robot{robot_idx}_eef_pos'][-1],
             env_obs[f'robot{robot_idx}_eef_rot_axis_angle'][-1]
         ], axis=-1))
+
+    return get_real_umi_action_from_base_pose(
+        action=action,
+        base_pose=base_poses,
+        action_pose_repr=action_pose_repr)
+
+
+def get_real_umi_action_from_base_pose(
+        action: np.ndarray,
+        base_pose,
+        action_pose_repr: str='abs'
+    ):
+    action = np.asarray(action)
+    n_robots = int(action.shape[-1] // 10)
+    if action.shape[-1] != n_robots * 10:
+        raise RuntimeError(f"Action last dim must be a multiple of 10, got {action.shape[-1]}.")
+
+    if n_robots == 1 and np.asarray(base_pose).shape == (6,):
+        base_poses = [np.asarray(base_pose, dtype=np.float64)]
+    else:
+        if len(base_pose) != n_robots:
+            raise RuntimeError(
+                f"Expected {n_robots} base poses for action conversion, got {len(base_pose)}.")
+        base_poses = [
+            np.asarray(x, dtype=np.float64)
+            for x in base_pose
+        ]
+
+    env_action = list()
+    for robot_idx in range(n_robots):
+        # convert pose to mat
+        if base_poses[robot_idx].shape != (6,):
+            raise RuntimeError(
+                f"Base pose for robot{robot_idx} must have shape (6,), "
+                f"got {base_poses[robot_idx].shape}.")
+        pose_mat = pose_to_mat(base_poses[robot_idx])
 
         start = robot_idx * 10
         action_pose10d = action[..., start:start+9]

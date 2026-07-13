@@ -21,9 +21,6 @@ shape_meta: &shape_meta
   action: 
     shape: [7]
 
-env_runner:
-  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
-
 dataset:
   _target_: diffusion_policy.dataset.umi_teleop_image_dataset.UmiTeleopImageDataset
   shape_meta: *shape_meta
@@ -38,4 +35,3 @@ dataset:
   val_ratio: 0.00
   max_train_episodes: null
   delta_action: False
-

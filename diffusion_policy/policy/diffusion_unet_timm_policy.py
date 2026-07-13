@@ -1,4 +1,5 @@
 from typing import Dict
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,13 +126,40 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
         fixed_action_prefix: unnormalized action prefix
         result: must include "action" key
         """
+        debug = getattr(self, "debug_predict_action", False)
+        t_debug = time.perf_counter()
+        if debug:
+            shapes = {key: tuple(value.shape) for key, value in obs_dict.items()}
+            print(f"[DiffusionUnetTimmPolicy.predict_action] start obs_shapes={shapes}", flush=True)
         assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetTimmPolicy.predict_action] normalized "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
+            t_debug = time.perf_counter()
         B = next(iter(nobs.values())).shape[0]
 
         # condition through global feature
+        if debug:
+            nobs_shapes = {key: tuple(value.shape) for key, value in nobs.items()}
+            print(f"[DiffusionUnetTimmPolicy.predict_action] obs_encoder start nobs_shapes={nobs_shapes}", flush=True)
+            self.obs_encoder.debug_forward = True
         global_cond = self.obs_encoder(nobs)
+        if debug:
+            self.obs_encoder.debug_forward = False
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetTimmPolicy.predict_action] obs_encoder done "
+                f"in {time.perf_counter() - t_debug:.3f}s, global_cond_shape={tuple(global_cond.shape)}",
+                flush=True)
+            t_debug = time.perf_counter()
 
         # empty data for action
         cond_data = torch.zeros(size=(B, self.action_horizon, self.action_dim), device=self.device, dtype=self.dtype)
@@ -145,16 +173,36 @@ class DiffusionUnetTimmPolicy(BaseImagePolicy):
 
 
         # run sampling
+        if debug:
+            print(
+                "[DiffusionUnetTimmPolicy.predict_action] conditional_sample start "
+                f"num_inference_steps={self.num_inference_steps}",
+                flush=True)
         nsample = self.conditional_sample(
             condition_data=cond_data, 
             condition_mask=cond_mask,
             local_cond=None,
             global_cond=global_cond,
             **self.kwargs)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetTimmPolicy.predict_action] conditional_sample done "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
+            t_debug = time.perf_counter()
         
         # unnormalize prediction
         assert nsample.shape == (B, self.action_horizon, self.action_dim)
         action_pred = self.normalizer['action'].unnormalize(nsample)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetTimmPolicy.predict_action] unnormalize done "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
         
         result = {
             'action': action_pred,

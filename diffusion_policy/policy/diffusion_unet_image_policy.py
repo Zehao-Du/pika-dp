@@ -1,4 +1,5 @@
 from typing import Dict
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -127,9 +128,21 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         obs_dict: must include "obs" key
         result: must include "action" key
         """
+        debug = getattr(self, "debug_predict_action", False)
+        t_debug = time.perf_counter()
+        if debug:
+            print("[DiffusionUnetImagePolicy.predict_action] start", flush=True)
         assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetImagePolicy.predict_action] normalized "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
+            t_debug = time.perf_counter()
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -147,7 +160,18 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            if debug:
+                shapes = {key: tuple(value.shape) for key, value in this_nobs.items()}
+                print(f"[DiffusionUnetImagePolicy.predict_action] obs_encoder start shapes={shapes}", flush=True)
             nobs_features = self.obs_encoder(this_nobs)
+            if debug:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(
+                    "[DiffusionUnetImagePolicy.predict_action] obs_encoder done "
+                    f"in {time.perf_counter() - t_debug:.3f}s",
+                    flush=True)
+                t_debug = time.perf_counter()
             # reshape back to B, Do
             global_cond = nobs_features.reshape(B, -1)
             # empty data for action
@@ -156,7 +180,18 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         else:
             # condition through impainting
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
+            if debug:
+                shapes = {key: tuple(value.shape) for key, value in this_nobs.items()}
+                print(f"[DiffusionUnetImagePolicy.predict_action] obs_encoder start shapes={shapes}", flush=True)
             nobs_features = self.obs_encoder(this_nobs)
+            if debug:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(
+                    "[DiffusionUnetImagePolicy.predict_action] obs_encoder done "
+                    f"in {time.perf_counter() - t_debug:.3f}s",
+                    flush=True)
+                t_debug = time.perf_counter()
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(B, To, -1)
             cond_data = torch.zeros(size=(B, T, Da+Do), device=device, dtype=dtype)
@@ -165,16 +200,33 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             cond_mask[:,:To,Da:] = True
 
         # run sampling
+        if debug:
+            print("[DiffusionUnetImagePolicy.predict_action] conditional_sample start", flush=True)
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetImagePolicy.predict_action] conditional_sample done "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
+            t_debug = time.perf_counter()
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(
+                "[DiffusionUnetImagePolicy.predict_action] unnormalize done "
+                f"in {time.perf_counter() - t_debug:.3f}s",
+                flush=True)
 
         # get action
         start = To - 1

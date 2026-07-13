@@ -22,7 +22,6 @@ import numpy as np
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_unet_video_policy import DiffusionUnetVideoPolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
-from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
@@ -98,13 +97,6 @@ class TrainDiffusionUnetVideoWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
-
         # configure logging
         wandb_run = wandb.init(
             dir=str(self.output_dir),
@@ -165,32 +157,6 @@ class TrainDiffusionUnetVideoWorkspace(BaseWorkspace):
                         'epoch': self.epoch,
                         'lr': lr_scheduler.get_last_lr()[0]
                     }
-
-                    # eval
-                    should_eval = self.global_step % cfg.training.eval_every == 0
-                    if (not cfg.training.eval_first) and (self.global_step == 0):
-                        should_eval = False
-                    if should_eval:
-                        policy = self.model
-                        if cfg.training.use_ema:
-                            policy = self.ema_model
-                        policy.eval()
-                        runner_log = env_runner.run(policy)
-                        policy.train()
-                        step_log.update(runner_log)
-
-                        # checkpointing
-                        if cfg.checkpoint.save_last_ckpt:
-                            self.save_checkpoint()
-                        if cfg.checkpoint.save_last_snapshot:
-                            self.save_snapshot()
-
-                        save_path = topk_manager.get_ckpt_path({
-                            'epoch': self.epoch,
-                            'test_score': runner_log['test/mean_score']
-                        })
-                        if save_path is not None:
-                            self.save_checkpoint(path=save_path)
 
                     # validation
                     should_val = self.global_step % cfg.training.val_every == 0

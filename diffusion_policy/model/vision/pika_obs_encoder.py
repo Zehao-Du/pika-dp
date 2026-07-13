@@ -1,5 +1,6 @@
 import copy
 import logging
+import time
 
 import timm
 import torch
@@ -139,12 +140,27 @@ class PikaObsEncoder(ModuleAttrMixin):
         )
 
     def _encode_rgb(self, key, img):
+        debug = getattr(self, "debug_forward", False)
+        t_debug = time.perf_counter()
         B, T = img.shape[:2]
         img = img.reshape(B * T, *img.shape[2:])
+        if debug:
+            print(f"[PikaObsEncoder] rgb {key} reshape -> {tuple(img.shape)}", flush=True)
         img = self._resize(img)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[PikaObsEncoder] rgb {key} resize done in {time.perf_counter() - t_debug:.3f}s", flush=True)
+            t_debug = time.perf_counter()
         img = (img - self.rgb_mean.to(dtype=img.dtype)) / self.rgb_std.to(dtype=img.dtype)
 
+        if debug:
+            print(f"[PikaObsEncoder] rgb {key} model forward start", flush=True)
         raw_feature = self.key_rgb_model_map[key](img)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[PikaObsEncoder] rgb {key} model forward done in {time.perf_counter() - t_debug:.3f}s", flush=True)
         if raw_feature.ndim != 3:
             raise RuntimeError(
                 f"RGB model {self.rgb_model_name} must return token features with shape [B,N,D], "
@@ -154,12 +170,27 @@ class PikaObsEncoder(ModuleAttrMixin):
         return feature.reshape(B, -1)
 
     def _encode_depth(self, key, depth):
+        debug = getattr(self, "debug_forward", False)
+        t_debug = time.perf_counter()
         B, T = depth.shape[:2]
         depth = depth.reshape(B * T, *depth.shape[2:])
+        if debug:
+            print(f"[PikaObsEncoder] depth {key} reshape -> {tuple(depth.shape)}", flush=True)
         depth = torch.clamp(depth, min=0.0, max=self.depth_max) / self.depth_max
         depth = self._resize(depth)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[PikaObsEncoder] depth {key} resize done in {time.perf_counter() - t_debug:.3f}s", flush=True)
+            t_debug = time.perf_counter()
 
+        if debug:
+            print(f"[PikaObsEncoder] depth {key} model forward start", flush=True)
         feature = self.key_depth_model_map[key](depth)
+        if debug:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"[PikaObsEncoder] depth {key} model forward done in {time.perf_counter() - t_debug:.3f}s", flush=True)
         if feature.ndim != 2:
             raise RuntimeError(
                 f"Depth model {self.depth_model_name} must return pooled features with shape [B,D], "
@@ -168,10 +199,15 @@ class PikaObsEncoder(ModuleAttrMixin):
         return feature.reshape(B, -1)
 
     def forward(self, obs_dict):
+        debug = getattr(self, "debug_forward", False)
+        if debug:
+            print("[PikaObsEncoder] forward start", flush=True)
         features = list()
         batch_size = next(iter(obs_dict.values())).shape[0]
 
         for key in self.rgb_keys:
+            if debug:
+                print(f"[PikaObsEncoder] encode rgb {key} start", flush=True)
             if key not in obs_dict:
                 raise KeyError(f"Missing rgb obs key: {key}")
             img = obs_dict[key]
@@ -181,8 +217,12 @@ class PikaObsEncoder(ModuleAttrMixin):
             if tuple(img.shape[2:]) != self.key_shape_map[key]:
                 raise ValueError(f"Shape mismatch for {key}: {tuple(img.shape[2:])} != {self.key_shape_map[key]}")
             features.append(self._encode_rgb(key, img))
+            if debug:
+                print(f"[PikaObsEncoder] encode rgb {key} done", flush=True)
 
         for key in self.depth_keys:
+            if debug:
+                print(f"[PikaObsEncoder] encode depth {key} start", flush=True)
             if key not in obs_dict:
                 raise KeyError(f"Missing depth obs key: {key}")
             depth = obs_dict[key]
@@ -192,8 +232,12 @@ class PikaObsEncoder(ModuleAttrMixin):
             if tuple(depth.shape[2:]) != self.key_shape_map[key]:
                 raise ValueError(f"Shape mismatch for {key}: {tuple(depth.shape[2:])} != {self.key_shape_map[key]}")
             features.append(self._encode_depth(key, depth))
+            if debug:
+                print(f"[PikaObsEncoder] encode depth {key} done", flush=True)
 
         for key in self.low_dim_keys:
+            if debug:
+                print(f"[PikaObsEncoder] encode low_dim {key} start", flush=True)
             if key not in obs_dict:
                 raise KeyError(f"Missing low_dim obs key: {key}")
             data = obs_dict[key]
@@ -203,10 +247,15 @@ class PikaObsEncoder(ModuleAttrMixin):
             if tuple(data.shape[2:]) != self.key_shape_map[key]:
                 raise ValueError(f"Shape mismatch for {key}: {tuple(data.shape[2:])} != {self.key_shape_map[key]}")
             features.append(data.reshape(B, -1))
+            if debug:
+                print(f"[PikaObsEncoder] encode low_dim {key} done", flush=True)
 
         if not features:
             raise RuntimeError("No observation features were produced.")
-        return torch.cat(features, dim=-1)
+        output = torch.cat(features, dim=-1)
+        if debug:
+            print(f"[PikaObsEncoder] forward done output_shape={tuple(output.shape)}", flush=True)
+        return output
 
     @torch.no_grad()
     def output_shape(self):
