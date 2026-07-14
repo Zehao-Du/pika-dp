@@ -488,7 +488,8 @@ class RealmanInterpolationController(mp.Process):
             ret, raw_state = robot.rm_get_current_arm_state()
             if ret == 0:
                 pose = _check_vector('pose', raw_state['pose'], (6,))
-                joint = _check_vector('joint', raw_state['joint'], (self.joint_dim,))
+                joint_deg = _check_vector('joint', raw_state['joint'], (self.joint_dim,))
+                joint = np.deg2rad(joint_deg)
                 return pose, joint
             last_ret = ret
             if attempt < self.state_read_retries - 1 and self.state_read_retry_delay > 0:

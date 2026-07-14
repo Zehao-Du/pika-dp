@@ -178,6 +178,33 @@ def _get_depth_transform(input_res, output_res):
     return transform
 
 
+def _transform_intrinsics(intrinsics, input_res, output_res):
+    iw, ih = input_res
+    ow, oh = output_res
+    input_ratio = iw / ih
+    output_ratio = ow / oh
+
+    if input_ratio >= output_ratio:
+        rh = oh
+        rw = math.ceil(rh / ih * iw)
+    else:
+        rw = ow
+        rh = math.ceil(rw / iw * ih)
+
+    crop_x = (rw - ow) // 2
+    crop_y = (rh - oh) // 2
+    scale_x = rw / iw
+    scale_y = rh / ih
+    out = np.asarray(intrinsics, dtype=np.float64).copy()
+    if out.shape != (3, 3):
+        raise ValueError(f"Camera intrinsics must have shape (3, 3), got {out.shape}.")
+    out[0, 0] *= scale_x
+    out[1, 1] *= scale_y
+    out[0, 2] = out[0, 2] * scale_x - crop_x
+    out[1, 2] = out[1, 2] * scale_y - crop_y
+    return out
+
+
 class UmiEnv:
     def __init__(self, 
             # required params
@@ -435,6 +462,8 @@ class UmiEnv:
         self.camera_obs_horizon = camera_obs_horizon
         self.robot_obs_horizon = robot_obs_horizon
         self.gripper_obs_horizon = gripper_obs_horizon
+        self.camera_resolution = camera_resolution
+        self.obs_image_resolution = obs_image_resolution
         self.debug_get_obs = debug_get_obs
         # recording
         self.output_dir = output_dir
@@ -462,28 +491,69 @@ class UmiEnv:
                 f"pika_gripper={self.gripper.is_ready}.")
     
     def start(self, wait=True):
-        print("[UmiEnv.start] starting camera...", flush=True)
-        self.camera.start(wait=False)
-        print("[UmiEnv.start] starting gripper...", flush=True)
-        self.gripper.start(wait=False)
-        print("[UmiEnv.start] starting robot...", flush=True)
-        self.robot.start(wait=False)
-        if self.multi_cam_vis is not None:
-            print("[UmiEnv.start] starting multi camera viewer...", flush=True)
-            self.multi_cam_vis.start(wait=False)
-        if wait:
-            self.start_wait()
+        started = []
+        try:
+            print("[UmiEnv.start] starting camera...", flush=True)
+            self.camera.start(wait=False)
+            started.append(self.camera)
+            print("[UmiEnv.start] starting gripper...", flush=True)
+            self.gripper.start(wait=False)
+            started.append(self.gripper)
+            print("[UmiEnv.start] starting robot...", flush=True)
+            self.robot.start(wait=False)
+            started.append(self.robot)
+            if self.multi_cam_vis is not None:
+                print("[UmiEnv.start] starting multi camera viewer...", flush=True)
+                self.multi_cam_vis.start(wait=False)
+                started.append(self.multi_cam_vis)
+            if wait:
+                self.start_wait()
+        except BaseException:
+            for component in reversed(started):
+                try:
+                    component.stop(wait=False)
+                except BaseException:
+                    pass
+            for component in reversed(started):
+                try:
+                    if hasattr(component, "stop_wait"):
+                        component.stop_wait()
+                    elif hasattr(component, "end_wait"):
+                        component.end_wait()
+                    elif hasattr(component, "join"):
+                        component.join()
+                except BaseException:
+                    pass
+            raise
 
     def stop(self, wait=True):
-        if self.is_ready:
-            self.end_episode()
+        errors = []
+        try:
+            if self.is_ready:
+                self.end_episode()
+        except BaseException as exc:
+            errors.append(exc)
+        components = [self.robot, self.gripper, self.camera]
         if self.multi_cam_vis is not None:
-            self.multi_cam_vis.stop(wait=False)
-        self.robot.stop(wait=False)
-        self.gripper.stop(wait=False)
-        self.camera.stop(wait=False)
+            components.insert(0, self.multi_cam_vis)
+        for component in components:
+            try:
+                component.stop(wait=False)
+            except BaseException as exc:
+                errors.append(exc)
         if wait:
-            self.stop_wait()
+            for component in components:
+                try:
+                    if hasattr(component, "stop_wait"):
+                        component.stop_wait()
+                    elif hasattr(component, "end_wait"):
+                        component.end_wait()
+                    elif hasattr(component, "join"):
+                        component.join()
+                except BaseException as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def start_wait(self):
         print("[UmiEnv.start_wait] waiting for camera...", flush=True)
@@ -501,11 +571,17 @@ class UmiEnv:
             print("[UmiEnv.start_wait] multi camera viewer ready.", flush=True)
     
     def stop_wait(self):
-        self.robot.stop_wait()
-        self.gripper.stop_wait()
-        self.camera.stop_wait()
+        errors = []
+        components = [self.robot, self.gripper, self.camera]
         if self.multi_cam_vis is not None:
-            self.multi_cam_vis.stop_wait()
+            components.append(self.multi_cam_vis)
+        for component in components:
+            try:
+                component.stop_wait()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     # ========= context manager ===========
     def __enter__(self):
@@ -543,7 +619,14 @@ class UmiEnv:
             print("[UmiEnv.get_obs] camera read done", flush=True)
 
         # 125/500 hz, robot_receive_timestamp
-        robot_k = max(2, self.robot_obs_horizon * self.robot_down_sample_steps + 2)
+        robot_history_sec = (
+            max(0.0, self.camera_obs_latency - self.robot_obs_latency)
+            + max(0, self.robot_obs_horizon - 1) * self.robot_down_sample_steps / self.frequency
+        )
+        robot_k = max(
+            2,
+            math.ceil(robot_history_sec * self.robot.frequency) + 4,
+        )
         if self.debug_get_obs:
             print(f"[UmiEnv.get_obs] reading robot k={robot_k}", flush=True)
         if self.robot.ring_buffer.count < robot_k:
@@ -555,7 +638,14 @@ class UmiEnv:
             print("[UmiEnv.get_obs] robot read done", flush=True)
 
         # 30 hz, gripper_receive_timestamp
-        gripper_k = max(2, self.gripper_obs_horizon * self.gripper_down_sample_steps + 2)
+        gripper_history_sec = (
+            max(0.0, self.camera_obs_latency - self.gripper_obs_latency)
+            + max(0, self.gripper_obs_horizon - 1) * self.gripper_down_sample_steps / self.frequency
+        )
+        gripper_k = max(
+            2,
+            math.ceil(gripper_history_sec * self.gripper.frequency) + 4,
+        )
         if self.debug_get_obs:
             print(f"[UmiEnv.get_obs] reading gripper k={gripper_k}", flush=True)
         if self.gripper.ring_buffer.count < gripper_k:
@@ -592,6 +682,12 @@ class UmiEnv:
             last_robot_data['robot_timestamp'],
             last_robot_data['ActualTCPPose'],
             "Realman state")
+        if robot_obs_timestamps[0] < robot_t[0] or robot_obs_timestamps[-1] > robot_t[-1]:
+            raise RuntimeError(
+                "Realman state history does not cover requested camera-aligned timestamps: "
+                f"state={robot_t[0]:.6f}..{robot_t[-1]:.6f}, "
+                f"requested={robot_obs_timestamps[0]:.6f}..{robot_obs_timestamps[-1]:.6f}."
+            )
         pika_gripper_poses = _realman_tcp_pose_to_pika_gripper_pose(realman_tcp_poses)
         if self.debug_get_obs:
             print(
@@ -606,9 +702,23 @@ class UmiEnv:
         if self.debug_get_obs:
             print("[UmiEnv.get_obs] interpolating robot pose", flush=True)
         pika_gripper_pose = robot_pose_interpolator(robot_obs_timestamps)
+        joint_pos_t, joint_pos = _dedupe_time_series(
+            last_robot_data['robot_timestamp'],
+            last_robot_data['ActualQ'],
+            "Realman joint position",
+        )
+        joint_vel_t, joint_vel = _dedupe_time_series(
+            last_robot_data['robot_timestamp'],
+            last_robot_data['ActualQd'],
+            "Realman joint velocity",
+        )
+        joint_pos_interpolator = get_interp1d(t=joint_pos_t, x=joint_pos)
+        joint_vel_interpolator = get_interp1d(t=joint_vel_t, x=joint_vel)
         robot_obs = {
             'robot0_eef_pos': pika_gripper_pose[...,:3],
-            'robot0_eef_rot_axis_angle': pika_gripper_pose[...,3:]
+            'robot0_eef_rot_axis_angle': pika_gripper_pose[...,3:],
+            'robot0_joint_pos': joint_pos_interpolator(robot_obs_timestamps),
+            'robot0_joint_vel': joint_vel_interpolator(robot_obs_timestamps),
         }
 
         # align gripper obs
@@ -618,6 +728,15 @@ class UmiEnv:
             last_gripper_data['gripper_timestamp'],
             last_gripper_data['gripper_position'][...,None],
             "Pika gripper state")
+        if (
+            gripper_obs_timestamps[0] < gripper_t[0]
+            or gripper_obs_timestamps[-1] > gripper_t[-1]
+        ):
+            raise RuntimeError(
+                "Pika gripper history does not cover requested camera-aligned timestamps: "
+                f"state={gripper_t[0]:.6f}..{gripper_t[-1]:.6f}, "
+                f"requested={gripper_obs_timestamps[0]:.6f}..{gripper_obs_timestamps[-1]:.6f}."
+            )
         if self.debug_get_obs:
             print(
                 "[UmiEnv.get_obs] gripper timestamp range "
@@ -629,10 +748,19 @@ class UmiEnv:
             t=gripper_t,
             x=gripper_pos
         )
+        gripper_vel_t, gripper_vel = _dedupe_time_series(
+            last_gripper_data['gripper_timestamp'],
+            last_gripper_data['gripper_velocity'][..., None],
+            "Pika gripper velocity",
+        )
         if self.debug_get_obs:
             print("[UmiEnv.get_obs] interpolating gripper", flush=True)
         gripper_obs = {
-            'robot0_gripper_width': gripper_interpolator(gripper_obs_timestamps)
+            'robot0_gripper_width': gripper_interpolator(gripper_obs_timestamps),
+            'robot0_gripper_velocity': get_interp1d(
+                t=gripper_vel_t,
+                x=gripper_vel,
+            )(gripper_obs_timestamps),
         }
         if self.debug_get_obs:
             print("[UmiEnv.get_obs] alignment done", flush=True)
@@ -713,6 +841,18 @@ class UmiEnv:
     
     def get_robot_state(self):
         return self.robot.get_state()
+
+    def get_current_eef_pose(self):
+        self._require_ready()
+        state = self.robot.get_state()
+        return _realman_tcp_pose_to_pika_gripper_pose(state['ActualTCPPose'])
+
+    def get_camera_intrinsics(self):
+        return _transform_intrinsics(
+            self.camera.get_intrinsics(),
+            input_res=self.camera_resolution,
+            output_res=self.obs_image_resolution,
+        )
 
     # recording API
     def start_episode(self, start_time=None):

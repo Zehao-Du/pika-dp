@@ -1,0 +1,3 @@
+[submodule "diffusion_policy/model/mappolicy/representation"]
+	path = diffusion_policy/model/mappolicy/representation
+	url = https://github.com/Zehao-Du/DigitalGene-4d.git

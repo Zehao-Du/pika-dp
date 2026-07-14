@@ -17,6 +17,7 @@ from threadpoolctl import threadpool_limits
 from multiprocessing.managers import SharedMemoryManager
 
 from umi.common.timestamp_accumulator import get_accumulate_timestamp_idxs
+from umi.shared_memory.shared_ndarray import SharedNDArray
 from umi.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from umi.shared_memory.shared_memory_queue import SharedMemoryQueue, Empty
 from umi.real_world.video_recorder import VideoRecorder
@@ -145,6 +146,12 @@ class PikaCamera(mp.Process):
             examples=command_examples,
             buffer_size=128,
         )
+        intrinsics_array = SharedNDArray.create_from_shape(
+            mem_mgr=shm_manager,
+            shape=(3, 3),
+            dtype=np.float64,
+        )
+        intrinsics_array.get()[:] = np.eye(3, dtype=np.float64)
 
         if video_recorder is None:
             video_recorder = [
@@ -188,6 +195,7 @@ class PikaCamera(mp.Process):
         self.ring_buffer = ring_buffer
         self.vis_ring_buffer = vis_ring_buffer
         self.command_queue = command_queue
+        self.intrinsics_array = intrinsics_array
         self.error_queue = mp.Queue()
 
     def __enter__(self):
@@ -254,6 +262,11 @@ class PikaCamera(mp.Process):
 
     def get_vis(self, out=None):
         return self.vis_ring_buffer.get(out=out)
+
+    def get_intrinsics(self):
+        if not self.ready_event.is_set():
+            raise RuntimeError("PikaCamera must be ready before reading intrinsics.")
+        return self.intrinsics_array.get().copy()
 
     def restart_put(self, start_time):
         if start_time is None:
@@ -324,6 +337,16 @@ class PikaCamera(mp.Process):
         profile = pipeline.start(config)
         align = rs.align(rs.stream.color)
         depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        color_stream = profile.get_stream(rs.stream.color)
+        intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+        self.intrinsics_array.get()[:] = np.array(
+            [
+                [intrinsics.fx, 0.0, intrinsics.ppx],
+                [0.0, intrinsics.fy, intrinsics.ppy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
 
         for _ in range(10):
             pipeline.wait_for_frames()
