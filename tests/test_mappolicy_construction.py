@@ -115,6 +115,50 @@ class _FakeSAM3Processor:
         }
 
 
+class _FakeSAM3VideoPredictor:
+    def __init__(self):
+        self.requests = []
+        self.frames = None
+
+    def handle_request(self, request):
+        self.requests.append(request)
+        if request["type"] == "start_session":
+            self.frames = request["resource_path"]
+            return {"session_id": "session-1"}
+        if request["type"] == "add_prompt":
+            height = self.frames[0].height
+            width = self.frames[0].width
+            return {
+                "frame_index": 0,
+                "outputs": {
+                    "out_obj_ids": np.array([7]),
+                    "out_probs": np.array([0.9], dtype=np.float32),
+                    "out_binary_masks": np.ones(
+                        (1, height, width), dtype=bool
+                    ),
+                },
+            }
+        if request["type"] == "close_session":
+            return {"is_success": True}
+        raise AssertionError(f"Unexpected request: {request}")
+
+    def handle_stream_request(self, request):
+        self.requests.append(request)
+        height = self.frames[0].height
+        width = self.frames[0].width
+        for frame_index in range(1, len(self.frames)):
+            yield {
+                "frame_index": frame_index,
+                "outputs": {
+                    "out_obj_ids": np.array([7]),
+                    "out_probs": np.array([0.9], dtype=np.float32),
+                    "out_binary_masks": np.ones(
+                        (1, height, width), dtype=bool
+                    ),
+                },
+            }
+
+
 class _FakeEstimator:
     def __init__(self):
         self.calls = []
@@ -154,13 +198,14 @@ class RealWorldConstructionTest(unittest.TestCase):
                 task_name="PickObject",
                 metadata_path=metadata_path,
                 sam3_processor=processor,
+                sam3_video_predictor=_FakeSAM3VideoPredictor(),
                 foundationpose_factory=lambda object_spec: estimator,
                 output_device="cpu",
                 map_builder=map_builder,
             )
             output_from_camera = np.eye(4)
             output_from_camera[0, 3] = 10.0
-            result = constructor.construct(
+            result = constructor.construct_from_rgbd(
                 rgb=np.zeros((4, 5, 3), dtype=np.uint8),
                 depth=np.ones((4, 5), dtype=np.float32),
                 camera_intrinsics=np.array(
@@ -190,6 +235,144 @@ class RealWorldConstructionTest(unittest.TestCase):
         self.assertEqual(len(map_builder_calls), 1)
         self.assertEqual(processor.confidence_threshold, 0.0)
 
+    def test_simulator_gt_path_calls_task_map_factory_directly(self):
+        calls = []
+
+        def map_factory(**kwargs):
+            calls.append(kwargs)
+            return "simulator-map"
+
+        positions = torch.tensor([[1.0, 2.0, 3.0]])
+        rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+        sizes = torch.tensor([[0.1, 0.2, 0.3]])
+        relations = torch.tensor([[0.01]])
+
+        result = construction.construct_map_from_simulator_gt(
+            map_factory=map_factory,
+            positions=positions,
+            rotations_6d=rotations,
+            size_parameters=sizes,
+            relation_parameters=relations,
+            preprocess=False,
+        )
+
+        self.assertEqual(result, "simulator-map")
+        self.assertIs(calls[0]["positions"], positions)
+        self.assertIs(calls[0]["rotations"], rotations)
+        self.assertIs(calls[0]["size_parameters"], sizes)
+        self.assertIs(calls[0]["relation_parameters"], relations)
+        self.assertFalse(calls[0]["preprocess"])
+
+    def test_explicit_rgbd_entrypoint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mesh_path = pathlib.Path(tmp_dir) / "target.obj"
+            mesh_path.write_text("o target\n", encoding="utf-8")
+            metadata_path = self._write_task(
+                tmp_dir,
+                _task_payload(mesh_path.name),
+            )
+            constructor = construction.RealWorldMapConstructor(
+                task_name="PickObject",
+                metadata_path=metadata_path,
+                sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=_FakeSAM3VideoPredictor(),
+                foundationpose_factory=lambda object_spec: _FakeEstimator(),
+                map_builder=lambda task_spec, object_results, device: "rgbd-map",
+            )
+            result = constructor.construct_from_rgbd(
+                rgb=np.zeros((4, 5, 3), dtype=np.uint8),
+                depth=np.ones((4, 5), dtype=np.float32),
+                camera_intrinsics=np.array(
+                    [[100, 0, 2], [0, 100, 2], [0, 0, 1]],
+                    dtype=np.float32,
+                ),
+                output_from_camera=np.eye(4),
+            )
+
+        self.assertEqual(result.map4d, "rgbd-map")
+
+    def test_later_frames_use_video_tracking_without_text_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mesh_path = pathlib.Path(tmp_dir) / "target.obj"
+            mesh_path.write_text("o target\n", encoding="utf-8")
+            metadata_path = self._write_task(
+                tmp_dir,
+                _task_payload(mesh_path.name),
+            )
+            video_predictor = _FakeSAM3VideoPredictor()
+            constructor = construction.RealWorldMapConstructor(
+                task_name="PickObject",
+                metadata_path=metadata_path,
+                sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=video_predictor,
+                foundationpose_factory=lambda object_spec: _FakeEstimator(),
+                map_builder=lambda task_spec, object_results, device: "rgbd-map",
+            )
+            first_frame = np.zeros((4, 5, 3), dtype=np.uint8)
+            first_result = constructor.construct_from_rgbd(
+                rgb=first_frame,
+                depth=np.ones((4, 5), dtype=np.float32),
+                camera_intrinsics=np.array(
+                    [[100, 0, 2], [0, 100, 2], [0, 0, 1]],
+                    dtype=np.float32,
+                ),
+                output_from_camera=np.eye(4),
+            )
+            tracked = constructor.track_masks_after_first_frame(
+                rgb_video=np.stack([first_frame, first_frame, first_frame]),
+                first_frame_result=first_result,
+            )
+
+        self.assertEqual(len(tracked), 2)
+        self.assertEqual(len(tracked[0]), 1)
+        self.assertEqual(tracked[0][0].instance_index, 7)
+        self.assertEqual(int(tracked[0][0].mask.sum()), 20)
+        prompt_request = next(
+            request
+            for request in video_predictor.requests
+            if request["type"] == "add_prompt"
+        )
+        self.assertNotIn("text", prompt_request)
+        self.assertEqual(prompt_request["frame_index"], 0)
+        self.assertIn("bounding_boxes", prompt_request)
+
+    def test_tracking_omission_raises_without_image_fallback(self):
+        class MissingFrameVideoPredictor(_FakeSAM3VideoPredictor):
+            def handle_stream_request(self, request):
+                self.requests.append(request)
+                return iter(())
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            mesh_path = pathlib.Path(tmp_dir) / "target.obj"
+            mesh_path.write_text("o target\n", encoding="utf-8")
+            metadata_path = self._write_task(
+                tmp_dir,
+                _task_payload(mesh_path.name),
+            )
+            constructor = construction.RealWorldMapConstructor(
+                task_name="PickObject",
+                metadata_path=metadata_path,
+                sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=MissingFrameVideoPredictor(),
+                foundationpose_factory=lambda object_spec: _FakeEstimator(),
+                map_builder=lambda task_spec, object_results, device: "rgbd-map",
+            )
+            first_frame = np.zeros((4, 5, 3), dtype=np.uint8)
+            first_result = constructor.construct_from_rgbd(
+                rgb=first_frame,
+                depth=np.ones((4, 5), dtype=np.float32),
+                camera_intrinsics=np.array(
+                    [[100, 0, 2], [0, 100, 2], [0, 0, 1]],
+                    dtype=np.float32,
+                ),
+                output_from_camera=np.eye(4),
+            )
+            with self.assertRaisesRegex(RuntimeError, "omitted frames"):
+                constructor.track_masks_after_first_frame(
+                    rgb_video=[first_frame, first_frame],
+                    first_frame_result=first_result,
+                )
+
     def test_schema_requires_explicit_selection(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             mesh_path = pathlib.Path(tmp_dir) / "target.obj"
@@ -215,11 +398,12 @@ class RealWorldConstructionTest(unittest.TestCase):
                 task_name="PickObject",
                 metadata_path=metadata_path,
                 sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=_FakeSAM3VideoPredictor(),
                 foundationpose_factory=lambda object_spec: _FakeEstimator(),
                 map_builder=lambda task_spec, object_results, device: object(),
             )
             with self.assertRaisesRegex(RuntimeError, "requires at least"):
-                constructor.construct(
+                constructor.construct_from_rgbd(
                     rgb=np.zeros((4, 5, 3), dtype=np.uint8),
                     depth=np.zeros((4, 5), dtype=np.float32),
                     camera_intrinsics=np.array(
@@ -334,11 +518,12 @@ class RealWorldConstructionTest(unittest.TestCase):
                 task_name="PickObject",
                 metadata_path=metadata_path,
                 sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=_FakeSAM3VideoPredictor(),
                 foundationpose_factory=lambda object_spec: FallbackEstimator(),
                 map_builder=lambda task_spec, object_results, device: object(),
             )
             with self.assertRaisesRegex(RuntimeError, "pose_last was not set"):
-                constructor.construct(
+                constructor.construct_from_rgbd(
                     rgb=np.zeros((4, 5, 3), dtype=np.uint8),
                     depth=np.ones((4, 5), dtype=np.float32),
                     camera_intrinsics=np.array(
@@ -370,6 +555,7 @@ class RealWorldConstructionTest(unittest.TestCase):
                 task_name="PickObject",
                 metadata_path=metadata_path,
                 sam3_processor=_FakeSAM3Processor(),
+                sam3_video_predictor=_FakeSAM3VideoPredictor(),
                 foundationpose_factory=lambda object_spec: estimator,
                 map_builder=lambda task_spec, object_results, device: object(),
             )
@@ -382,9 +568,9 @@ class RealWorldConstructionTest(unittest.TestCase):
                 ),
                 "output_from_camera": np.eye(4),
             }
-            constructor.construct(**kwargs)
+            constructor.construct_from_rgbd(**kwargs)
             with self.assertRaisesRegex(RuntimeError, "pose_last was not set"):
-                constructor.construct(**kwargs)
+                constructor.construct_from_rgbd(**kwargs)
 
 
 if __name__ == "__main__":

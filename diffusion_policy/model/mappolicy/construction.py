@@ -1,4 +1,19 @@
-"""JSON-driven real-world Map4D construction.
+"""Map4D construction from simulator ground truth or real-world RGB-D.
+
+This module deliberately exposes two separate construction paths:
+
+1. :func:`construct_map_from_simulator_gt` is the simulator path.  The caller
+   reads exact object poses and structural parameters from the simulator and
+   passes those tensors directly to a task-specific ``Map4d_*`` class.  No
+   segmentation or pose estimation is performed on this path.
+2. :meth:`RealWorldMapConstructor.construct_from_rgbd` handles the first
+   inference frame with SAM3 image text prompting. Subsequent video frames use
+   :meth:`RealWorldMapConstructor.track_masks_after_first_frame`, which seeds
+   SAM3 tracking from the first-frame boxes and never re-runs text prompting.
+
+Keeping these paths separate is important: simulator ground truth must not be
+silently used by the real-world perception path, and perception failures must
+not be hidden by a ground-truth fallback.
 
 Each task is defined by ``representation/realworld/<task_name>.json`` with the
 task name as its top-level key. Required object schema:
@@ -63,6 +78,10 @@ import numpy as np
 from PIL import Image
 import torch
 
+# ============================= sam3 checkpoint ============================= #
+SAM3_CHECKPOINT_PATH = Path(
+    "/home/ubuntu/Documents/CodeField/zehao/foundation_models/sam3/sam3.pt"
+)
 
 REALWORLD_DIR = Path(__file__).resolve().parent / "representation" / "realworld"
 IDENTITY_ROTATION_6D = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -502,29 +521,38 @@ def load_realworld_task(
 def build_sam3_processor(
     *,
     device="cuda",
-    checkpoint_path=None,
-    load_from_hf=True,
 ):
     """Build the official Meta SAM3 image processor."""
-    if checkpoint_path is not None:
-        checkpoint_path = Path(checkpoint_path).expanduser().resolve()
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(f"SAM3 checkpoint not found: {checkpoint_path}")
-        checkpoint_path = str(checkpoint_path)
+    checkpoint_path = SAM3_CHECKPOINT_PATH.expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"SAM3 checkpoint not found: {checkpoint_path}")
     from sam3.model.sam3_image_processor import Sam3Processor
     from sam3.model_builder import build_sam3_image_model
 
-    if not isinstance(load_from_hf, bool):
-        raise ValueError("load_from_hf must be a boolean")
     model = build_sam3_image_model(
         device=device,
-        checkpoint_path=checkpoint_path,
-        load_from_HF=bool(load_from_hf),
+        checkpoint_path=str(checkpoint_path),
+        load_from_HF=False,
     )
     return Sam3Processor(
         model,
         device=device,
         confidence_threshold=0.0,
+    )
+
+
+def build_sam3_video_tracker():
+    """Build the official SAM3 video predictor used for tracking."""
+    checkpoint_path = SAM3_CHECKPOINT_PATH.expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"SAM3 video checkpoint not found: {checkpoint_path}"
+        )
+    from sam3.model_builder import build_sam3_video_predictor
+
+    return build_sam3_video_predictor(
+        checkpoint_path=str(checkpoint_path),
+        load_from_HF=False,
     )
 
 
@@ -619,8 +647,10 @@ def _pose_from_local(position, rotation_6d):
     return transform
 
 
-class SAM3Segmenter:
-    """Strict adapter around the official SAM3 image processor."""
+# =========================== pose from foundation models =========================== #
+
+class SAM3ImageSegmenter:
+    """SAM3 image prompting for the first inference frame only."""
 
     def __init__(self, processor):
         for method in (
@@ -636,7 +666,7 @@ class SAM3Segmenter:
     def set_image(self, rgb):
         return self.processor.set_image(Image.fromarray(rgb))
 
-    def segment(self, state, object_spec):
+    def segment_first_frame(self, state, object_spec):
         output = self.processor.set_text_prompt(
             state=state,
             prompt=object_spec.prompt,
@@ -712,14 +742,229 @@ class SAM3Segmenter:
         )
 
 
+class SAM3VideoTracker:
+    """Track first-frame SAM3 detections through later RGB video frames.
+
+    Each task object receives an independent official SAM3 video session. The
+    first-frame image result supplies a visual bounding-box prompt; frames
+    after index 0 are produced exclusively by ``propagate_in_video``. Missing
+    or invalid tracking output raises immediately and is never replaced by an
+    image-model prediction.
+    """
+
+    def __init__(self, predictor):
+        for method in ("handle_request", "handle_stream_request"):
+            if not callable(getattr(predictor, method, None)):
+                raise TypeError(
+                    f"SAM3 video predictor must define callable {method}()"
+                )
+        self.predictor = predictor
+
+    @staticmethod
+    def _tracking_result(outputs, frame_index, object_spec, expected_object_id):
+        for key in ("out_obj_ids", "out_probs", "out_binary_masks"):
+            if key not in outputs:
+                raise KeyError(
+                    f"SAM3 tracking output for frame {frame_index} is missing {key!r}"
+                )
+        object_ids = np.asarray(outputs["out_obj_ids"]).reshape(-1)
+        scores = np.asarray(outputs["out_probs"], dtype=np.float32).reshape(-1)
+        masks = np.asarray(outputs["out_binary_masks"])
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks = masks[:, 0]
+        if masks.ndim != 3:
+            raise ValueError(
+                f"SAM3 tracking masks for frame {frame_index} must have shape "
+                f"[N, H, W], got {masks.shape}"
+            )
+        if len(scores) != len(object_ids) or len(masks) != len(object_ids):
+            raise ValueError(
+                f"SAM3 tracking output lengths disagree on frame {frame_index}"
+            )
+        matches = np.flatnonzero(object_ids == expected_object_id)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"SAM3 tracking frame {frame_index} contains {len(matches)} masks "
+                f"for object id {expected_object_id}; expected exactly one"
+            )
+        match = int(matches[0])
+        score = float(scores[match])
+        if not np.isfinite(score) or score < object_spec.min_score:
+            raise RuntimeError(
+                f"SAM3 tracking score {score:.4f} for object "
+                f"{object_spec.name!r} on frame {frame_index} is below required "
+                f"min_score {object_spec.min_score:.4f}"
+            )
+        mask = np.asarray(masks[match], dtype=bool)
+        rows, columns = np.nonzero(mask)
+        if len(rows) == 0:
+            raise RuntimeError(
+                f"SAM3 tracking returned an empty mask for object "
+                f"{object_spec.name!r} on frame {frame_index}"
+            )
+        box_xyxy = np.asarray(
+            [columns.min(), rows.min(), columns.max() + 1, rows.max() + 1],
+            dtype=np.float32,
+        )
+        return SegmentationResult(
+            mask=mask,
+            box_xyxy=box_xyxy,
+            score=score,
+            instance_index=int(expected_object_id),
+        )
+
+    def track_after_first_frame(
+        self,
+        *,
+        rgb_video,
+        object_specs,
+        first_frame_segmentations,
+    ):
+        """Return tracked segmentations for video frames ``1..T-1``."""
+        if isinstance(rgb_video, np.ndarray):
+            if rgb_video.ndim != 4 or rgb_video.shape[-1] != 3:
+                raise ValueError(
+                    f"rgb_video array must have shape [T, H, W, 3], got "
+                    f"{rgb_video.shape}"
+                )
+        elif not isinstance(rgb_video, Sequence) or isinstance(
+            rgb_video, (str, bytes)
+        ):
+            raise TypeError("rgb_video must be a sequence of RGB frames")
+        if len(rgb_video) < 2:
+            raise ValueError("rgb_video must contain the first frame and a later frame")
+        frames = tuple(_as_rgb_uint8(frame) for frame in rgb_video)
+        image_shape = frames[0].shape
+        if any(frame.shape != image_shape for frame in frames[1:]):
+            raise ValueError("All rgb_video frames must have the same shape")
+        object_specs = tuple(object_specs)
+        first_frame_segmentations = tuple(first_frame_segmentations)
+        if len(object_specs) != len(first_frame_segmentations):
+            raise ValueError(
+                "object_specs and first_frame_segmentations must have equal length"
+            )
+
+        tracked_by_frame = [[] for _ in range(len(frames) - 1)]
+        video_resource = [Image.fromarray(frame) for frame in frames]
+        height, width = image_shape[:2]
+        for object_spec, first_segmentation in zip(
+            object_specs, first_frame_segmentations
+        ):
+            box = np.asarray(first_segmentation.box_xyxy, dtype=np.float32)
+            if box.shape != (4,) or not np.all(np.isfinite(box)):
+                raise ValueError(
+                    f"First-frame box for {object_spec.name!r} must be finite [4]"
+                )
+            x_min, y_min, x_max, y_max = box.tolist()
+            if not (0 <= x_min < x_max <= width and 0 <= y_min < y_max <= height):
+                raise ValueError(
+                    f"First-frame box for {object_spec.name!r} is outside the image"
+                )
+            box_xywh_normalized = [
+                x_min / width,
+                y_min / height,
+                (x_max - x_min) / width,
+                (y_max - y_min) / height,
+            ]
+
+            start_response = self.predictor.handle_request(
+                {
+                    "type": "start_session",
+                    "resource_path": video_resource,
+                }
+            )
+            if "session_id" not in start_response:
+                raise KeyError("SAM3 start_session response is missing 'session_id'")
+            session_id = start_response["session_id"]
+            try:
+                prompt_response = self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": 0,
+                        "bounding_boxes": [box_xywh_normalized],
+                        "bounding_box_labels": [1],
+                        "rel_coordinates": True,
+                    }
+                )
+                if prompt_response.get("frame_index") != 0:
+                    raise RuntimeError("SAM3 visual prompt did not run on frame 0")
+                prompt_outputs = prompt_response.get("outputs")
+                if not isinstance(prompt_outputs, Mapping):
+                    raise TypeError("SAM3 add_prompt response is missing outputs")
+                if "out_obj_ids" not in prompt_outputs:
+                    raise KeyError("SAM3 add_prompt outputs are missing 'out_obj_ids'")
+                prompt_object_ids = np.asarray(
+                    prompt_outputs["out_obj_ids"]
+                ).reshape(-1)
+                if len(prompt_object_ids) != 1:
+                    raise RuntimeError(
+                        f"SAM3 visual prompt for {object_spec.name!r} produced "
+                        f"{len(prompt_object_ids)} object ids; expected exactly one"
+                    )
+                tracked_object_id = int(prompt_object_ids[0])
+
+                seen_frames = set()
+                request = {
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": "forward",
+                    "start_frame_index": 1,
+                    "max_frame_num_to_track": len(frames) - 1,
+                }
+                for response in self.predictor.handle_stream_request(request):
+                    frame_index = response.get("frame_index")
+                    if not isinstance(frame_index, int):
+                        raise TypeError("SAM3 tracking response has invalid frame_index")
+                    if frame_index < 1 or frame_index >= len(frames):
+                        raise IndexError(
+                            f"SAM3 tracking returned out-of-range frame {frame_index}"
+                        )
+                    if frame_index in seen_frames:
+                        raise RuntimeError(
+                            f"SAM3 tracking returned frame {frame_index} twice"
+                        )
+                    outputs = response.get("outputs")
+                    if not isinstance(outputs, Mapping):
+                        raise TypeError(
+                            f"SAM3 tracking frame {frame_index} is missing outputs"
+                        )
+                    tracked_by_frame[frame_index - 1].append(
+                        self._tracking_result(
+                            outputs,
+                            frame_index,
+                            object_spec,
+                            tracked_object_id,
+                        )
+                    )
+                    seen_frames.add(frame_index)
+                expected_frames = set(range(1, len(frames)))
+                if seen_frames != expected_frames:
+                    missing = sorted(expected_frames.difference(seen_frames))
+                    raise RuntimeError(
+                        f"SAM3 tracking omitted frames {missing} for object "
+                        f"{object_spec.name!r}"
+                    )
+            finally:
+                self.predictor.handle_request(
+                    {"type": "close_session", "session_id": session_id}
+                )
+
+        return tuple(tuple(frame_results) for frame_results in tracked_by_frame)
+
 class RealWorldMapConstructor:
-    """Construct one Map4D frame with SAM3 masks and FoundationPose poses."""
+    """Construct one Map4D frame from RGB-D perception.
+
+    This class implements only the real-world path.  It does not read
+    simulator state and has no ground-truth fallback.
+    """
 
     def __init__(
         self,
         *,
         task_name,
         sam3_processor,
+        sam3_video_predictor,
         foundationpose_factory: Callable[[ObjectSpec], Any],
         metadata_root=REALWORLD_DIR,
         metadata_path=None,
@@ -737,7 +982,8 @@ class RealWorldMapConstructor:
             metadata_root=metadata_root,
             metadata_path=metadata_path,
         )
-        self.segmenter = SAM3Segmenter(sam3_processor)
+        self.image_segmenter = SAM3ImageSegmenter(sam3_processor)
+        self.video_tracker = SAM3VideoTracker(sam3_video_predictor)
         self.foundationpose_factory = foundationpose_factory
         self.output_device = torch.device(output_device)
         self.map_builder = map_builder
@@ -759,7 +1005,7 @@ class RealWorldMapConstructor:
                 )
             self.estimators[object_spec.name] = estimator
 
-    def construct(
+    def construct_from_rgbd(
         self,
         *,
         rgb,
@@ -767,6 +1013,18 @@ class RealWorldMapConstructor:
         camera_intrinsics,
         output_from_camera,
     ):
+        """Estimate object poses from RGB-D and instantiate a Map4D.
+
+        Pipeline:
+          1. SAM3 selects one mask for every object declared in task metadata.
+          2. FoundationPose registers each object's mesh using RGB, depth, and
+             the selected mask.
+          3. Camera-frame poses are transformed into the requested output
+             frame and used to instantiate the scene Map4D.
+
+        Returns a :class:`ConstructionResult`; the instantiated map is in its
+        ``map4d`` field.
+        """
         rgb = _as_rgb_uint8(rgb)
         depth = _as_depth_float32(depth, rgb.shape)
         camera_intrinsics = _as_intrinsics(camera_intrinsics)
@@ -774,10 +1032,13 @@ class RealWorldMapConstructor:
             output_from_camera,
             "output_from_camera",
         )
-        sam3_state = self.segmenter.set_image(rgb)
+        sam3_state = self.image_segmenter.set_image(rgb)
         object_results = []
         for object_spec in self.task_spec.objects:
-            segmentation = self.segmenter.segment(sam3_state, object_spec)
+            segmentation = self.image_segmenter.segment_first_frame(
+                sam3_state,
+                object_spec,
+            )
             valid_depth = (
                 segmentation.mask
                 & np.isfinite(depth)
@@ -817,8 +1078,10 @@ class RealWorldMapConstructor:
                 )
             )
 
+        # This builder consumes poses estimated above.  It is not the
+        # simulator-GT path, even when a custom map_builder is injected.
         if self.map_builder is None:
-            map4d = self._build_generic_map(object_results)
+            map4d = self._build_map_from_estimated_poses(object_results)
         else:
             map4d = self.map_builder(
                 self.task_spec,
@@ -856,7 +1119,30 @@ class RealWorldMapConstructor:
             objects=tuple(object_results),
         )
 
-    def _build_generic_map(self, object_results):
+    def track_masks_after_first_frame(self, *, rgb_video, first_frame_result):
+        """Track task objects after a successful first-frame construction.
+
+        ``rgb_video[0]`` must be the RGB frame used to produce
+        ``first_frame_result``. Returned entry 0 corresponds to video frame 1.
+        This method only runs the SAM3 video tracker; it never invokes the
+        image processor or text prompt.
+        """
+        if not isinstance(first_frame_result, ConstructionResult):
+            raise TypeError("first_frame_result must be a ConstructionResult")
+        if first_frame_result.task_spec is not self.task_spec:
+            raise ValueError(
+                "first_frame_result was not produced by this constructor"
+            )
+        return self.video_tracker.track_after_first_frame(
+            rgb_video=rgb_video,
+            object_specs=self.task_spec.objects,
+            first_frame_segmentations=(
+                result.segmentation for result in first_frame_result.objects
+            ),
+        )
+
+    def _build_map_from_estimated_poses(self, object_results):
+        """Build the generic Map4D using FoundationPose output transforms."""
         if self.representation_types is None:
             raise RuntimeError("Generic Map4D representation was not initialized")
         geometry, object_class, map_class, structure_node = self.representation_types
@@ -982,17 +1268,67 @@ def _representation_types():
     )
 
 
+# =========================== pose from simulator =========================== #
+
+def construct_map_from_simulator_gt(
+    *,
+    map_factory,
+    positions,
+    rotations_6d,
+    size_parameters,
+    relation_parameters,
+    **map_kwargs,
+):
+    """Instantiate a task-specific Map4D from simulator ground truth.
+
+    The simulator adapter is responsible for reading and arranging its GT
+    state into the flat, batched layouts expected by ``map_factory``.  For
+    example, ManiSkill's adapter may read ``actor.pose.raw_pose`` and fixed
+    episode geometry, convert quaternions to the representation's 6D rotation
+    convention, and concatenate values in the order documented by
+    ``representation/maps4d/<task>.json``.
+
+    This function is intentionally a thin boundary: it never consumes RGB-D
+    and never invokes SAM3 or FoundationPose.  ``map_factory`` is normally a
+    task class such as ``Map4d_StackCube`` or ``Map4d_PlugCharger``.
+
+    Args:
+        map_factory: Callable task-specific Map4D class or factory.
+        positions: Batched exact object positions read from the simulator.
+        rotations_6d: Batched exact rotations in the Map4D 6D convention.
+        size_parameters: Batched exact/fixed object geometry parameters.
+        relation_parameters: Batched exact inter-part relation parameters.
+        **map_kwargs: Optional task-specific arguments forwarded unchanged.
+
+    Returns:
+        The instantiated task-specific Map4D object.
+    """
+    if not callable(map_factory):
+        raise TypeError("map_factory must be callable")
+    return map_factory(
+        positions=positions,
+        rotations=rotations_6d,
+        size_parameters=size_parameters,
+        relation_parameters=relation_parameters,
+        **map_kwargs,
+    )
+
+
 __all__ = [
     "ConstructionResult",
     "ObjectPoseResult",
     "ObjectSpec",
     "PrimitiveSpec",
     "REALWORLD_DIR",
+    "SAM3_CHECKPOINT_PATH",
     "RealWorldMapConstructor",
-    "SAM3Segmenter",
+    "SAM3ImageSegmenter",
+    "SAM3VideoTracker",
     "SegmentationResult",
     "SizeParameterSpec",
     "TaskSpec",
     "build_sam3_processor",
+    "build_sam3_video_tracker",
+    "construct_map_from_simulator_gt",
     "load_realworld_task",
 ]
